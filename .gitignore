@@ -1,0 +1,12 @@
+.env
+venv/
+.venv/
+__pycache__/
+*.pyc
+.idea/
+
+# 런타임에 생성되는 로컬 테스트 데이터/산출물 (개인정보·테스트용 사진 포함 가능)
+local_reports.json
+local_users.json
+captured_*.jpg
+report_*.pdf
