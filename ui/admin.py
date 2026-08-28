@@ -10,9 +10,22 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 from styles import WINDOW_STYLE, BTN_PRIMARY, BTN_OUTLINE, BTN_DANGER, PRIMARY
+from sms_notifier import send_sms_notification
 
 ADMIN_COLOR   = "#0a6f80"
 LOCAL_REPORTS = "local_reports.json"
+LOCAL_USERS   = "local_users.json"
+
+
+def get_user_phone(user_id):
+    if not os.path.exists(LOCAL_USERS):
+        return None
+    with open(LOCAL_USERS, "r", encoding="utf-8") as f:
+        users = json.load(f)
+    for u in users:
+        if u.get("user_id") == user_id:
+            return u.get("phone")
+    return None
 
 
 class AdminWindow(QWidget):
@@ -197,9 +210,20 @@ class AdminWindow(QWidget):
         dialog.setLayout(layout)
 
         if dialog.exec():
-            reports[idx]["status"] = combo.currentText()
+            new_status = combo.currentText()
+            reports[idx]["status"] = new_status
             with open(LOCAL_REPORTS, "w", encoding="utf-8") as f:
                 json.dump(reports, f, ensure_ascii=False, indent=2)
+
+            # 접수 완료 안내는 이메일로 이미 나갔으므로(ui/report.py),
+            # 여기서는 "답변 이후" 단계(처리 완료)에만 SMS로 알린다.
+            if new_status == "완료":
+                phone = get_user_phone(reports[idx]["user_id"])
+                send_sms_notification(
+                    phone,
+                    f"[안전신고] 접수하신 민원이 처리 완료되었습니다. ({reports[idx]['location']})"
+                )
+
             QMessageBox.information(self, "완료", "상태가 변경되었습니다.")
             self.load_complaints()
 
@@ -236,6 +260,13 @@ class AdminWindow(QWidget):
             reports[idx]["reject_reason"] = reason
             with open(LOCAL_REPORTS, "w", encoding="utf-8") as f:
                 json.dump(reports, f, ensure_ascii=False, indent=2)
+
+            phone = get_user_phone(reports[idx]["user_id"])
+            send_sms_notification(
+                phone,
+                f"[안전신고] 접수하신 민원이 기각되었습니다. 사유: {reason}"
+            )
+
             QMessageBox.information(self, "완료", "기각/취소 처리되었습니다.")
             self.load_complaints()
 
