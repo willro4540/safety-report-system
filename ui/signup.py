@@ -170,8 +170,8 @@ class SignupWindow(QWidget):
                 conn.close()
                 return
             cursor.execute(
-                "INSERT INTO users (user_id, password, name, phone) VALUES (%s,%s,%s,%s)",
-                (user_id, hashed_pw, user_name, user_phone)
+                "INSERT INTO users (user_id, password, name, phone, role) VALUES (%s,%s,%s,%s,%s)",
+                (user_id, hashed_pw, user_name, user_phone, "user")
             )
             conn.commit()
             conn.close()

@@ -149,7 +149,7 @@ class LoginWindow(QWidget):
     def go_main(self, user_id, role):
         if role == "admin":
             from ui.admin import AdminWindow
-            self.main_window = AdminWindow()
+            self.main_window = AdminWindow(user_id)
         else:
             from ui.citizen_main import CitizenMainWindow
             self.main_window = CitizenMainWindow(user_id)

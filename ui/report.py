@@ -47,6 +47,8 @@ class ReportWindow(QWidget):
         super().__init__()
         self.user_id = user_id
         self.image_path = None
+        self.latitude = None
+        self.longitude = None
         self.setWindowTitle("민원 신고")
         self.resize(900, 650)
         self.setStyleSheet(WINDOW_STYLE)
@@ -221,6 +223,8 @@ class ReportWindow(QWidget):
                 return
             lat = self._convert_dms(gps_info["GPSLatitude"], gps_info["GPSLatitudeRef"])
             lon = self._convert_dms(gps_info["GPSLongitude"], gps_info["GPSLongitudeRef"])
+            self.latitude = lat
+            self.longitude = lon
             text = f"위도: {lat:.6f}, 경도: {lon:.6f}"
             self.lbl_gps_value.setText(text)
             self.input_location.setText(text)
@@ -254,7 +258,7 @@ class ReportWindow(QWidget):
         progress.show()
         QApplication.processEvents()
 
-        self.save_local(report_type, location, content)
+        self.save_report(report_type, location, content)
         pdf_path = self.create_pdf(report_type, location, content)
         self.send_email(report_type, location, content, pdf_path)
 
@@ -262,11 +266,29 @@ class ReportWindow(QWidget):
         QMessageBox.information(self, "접수 완료", "민원이 접수되었습니다.")
         self.close()
 
+    def save_report(self, report_type, location, content):
+        try:
+            from db.connection import get_connection
+            conn = get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO reports (user_id, type, location, latitude, longitude, content, image_path) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (self.user_id, report_type, location, self.latitude, self.longitude,
+                 content, self.image_path or "")
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            self.save_local(report_type, location, content)
+
     def save_local(self, report_type, location, content):
         data = {
             "user_id": self.user_id,
             "type": report_type,
             "location": location,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
             "content": content,
             "status": "접수",
             "image_path": self.image_path or "",

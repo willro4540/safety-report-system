@@ -18,6 +18,18 @@ LOCAL_USERS   = "local_users.json"
 
 
 def get_user_phone(user_id):
+    try:
+        from db.connection import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT phone FROM users WHERE user_id = %s", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0]
+    except Exception:
+        pass
+
     if not os.path.exists(LOCAL_USERS):
         return None
     with open(LOCAL_USERS, "r", encoding="utf-8") as f:
@@ -29,8 +41,11 @@ def get_user_phone(user_id):
 
 
 class AdminWindow(QWidget):
-    def __init__(self):
+    def __init__(self, admin_id):
         super().__init__()
+        self.admin_id = admin_id
+        self.data_source = None     # load_complaints가 "db" 또는 "local"로 채움
+        self.current_rows = []      # 화면에 표시된 순서 그대로 — 상태변경/기각 처리에서 재사용
         self.setWindowTitle("관리자 패널")
         self.resize(900, 650)
         self.setStyleSheet(WINDOW_STYLE)
@@ -142,57 +157,62 @@ class AdminWindow(QWidget):
         QApplication.processEvents()
         time.sleep(1)
 
+        self.list_widget.clear()
+        self.current_rows = []
+
         try:
             from db.connection import get_connection
             conn = get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, user_id, location, content, status, created_at FROM complaints ORDER BY created_at DESC"
+                "SELECT id, user_id, type, location, content, status, reject_reason, created_at "
+                "FROM reports ORDER BY created_at DESC"
             )
             rows = cursor.fetchall()
             conn.close()
-            self.list_widget.clear()
+            self.data_source = "db"
             for row in rows:
-                self.list_widget.addItem(
-                    f"[{row[5]}] {row[1]} | {row[2]} — {row[3][:20]} ({row[4]})"
-                )
-        except:
-            self.list_widget.clear()
+                self.current_rows.append({
+                    "id": row[0], "user_id": row[1], "type": row[2],
+                    "location": row[3], "content": row[4], "status": row[5],
+                    "reject_reason": row[6], "created_at": row[7]
+                })
+        except Exception:
+            self.data_source = "local"
             if os.path.exists(LOCAL_REPORTS):
                 with open(LOCAL_REPORTS, "r", encoding="utf-8") as f:
                     reports = json.load(f)
                 for i, r in enumerate(reports):
-                    status = r.get("status", "접수")
-                    rtype  = r.get("type", "")
-                    self.list_widget.addItem(
-                        f"[{i}] [{r['created_at']}] {r['user_id']} | {rtype} | {r['location']} — {r['content'][:20]} ({status})"
-                    )
-            else:
-                self.list_widget.addItem("신고 내역이 없습니다.")
+                    self.current_rows.append({
+                        "id": i, "user_id": r["user_id"], "type": r.get("type", ""),
+                        "location": r["location"], "content": r["content"],
+                        "status": r.get("status", "접수"),
+                        "reject_reason": r.get("reject_reason"),
+                        "created_at": r["created_at"]
+                    })
+
+        if not self.current_rows:
+            self.list_widget.addItem("신고 내역이 없습니다.")
+        else:
+            for r in self.current_rows:
+                self.list_widget.addItem(
+                    f"[{r['created_at']}] {r['user_id']} | {r['type']} | "
+                    f"{r['location']} — {r['content'][:20]} ({r['status']})"
+                )
 
         progress.close()
 
-    def get_selected_index(self):
-        item = self.list_widget.currentItem()
-        if not item:
+    def get_selected_row(self):
+        idx = self.list_widget.currentRow()
+        if idx < 0 or idx >= len(self.current_rows):
             QMessageBox.warning(self, "선택 오류", "신고 항목을 선택하세요.")
             return None
-        text = item.text()
-        try:
-            idx = int(text.split("]")[0].replace("[", "").strip())
-            return idx
-        except:
-            QMessageBox.warning(self, "오류", "항목 인덱스를 읽을 수 없습니다.")
-            return None
+        return self.current_rows[idx]
 
     def change_status(self):
-        idx = self.get_selected_index()
-        if idx is None:
+        row = self.get_selected_row()
+        if row is None:
             return
-        if not os.path.exists(LOCAL_REPORTS):
-            return
-        with open(LOCAL_REPORTS, "r", encoding="utf-8") as f:
-            reports = json.load(f)
 
         dialog = QDialog(self)
         dialog.setWindowTitle("상태 변경")
@@ -201,7 +221,7 @@ class AdminWindow(QWidget):
         lbl = QLabel("상태를 선택하세요:")
         combo = QComboBox()
         combo.addItems(["접수", "처리중", "완료"])
-        combo.setCurrentText(reports[idx].get("status", "접수"))
+        combo.setCurrentText(row["status"])
         btn_ok = QPushButton("확인")
         btn_ok.clicked.connect(dialog.accept)
         layout.addWidget(lbl)
@@ -211,30 +231,24 @@ class AdminWindow(QWidget):
 
         if dialog.exec():
             new_status = combo.currentText()
-            reports[idx]["status"] = new_status
-            with open(LOCAL_REPORTS, "w", encoding="utf-8") as f:
-                json.dump(reports, f, ensure_ascii=False, indent=2)
+            self._update_status(row, new_status)
 
             # 접수 완료 안내는 이메일로 이미 나갔으므로(ui/report.py),
             # 여기서는 "답변 이후" 단계(처리 완료)에만 SMS로 알린다.
             if new_status == "완료":
-                phone = get_user_phone(reports[idx]["user_id"])
+                phone = get_user_phone(row["user_id"])
                 send_sms_notification(
                     phone,
-                    f"[안전신고] 접수하신 민원이 처리 완료되었습니다. ({reports[idx]['location']})"
+                    f"[안전신고] 접수하신 민원이 처리 완료되었습니다. ({row['location']})"
                 )
 
             QMessageBox.information(self, "완료", "상태가 변경되었습니다.")
             self.load_complaints()
 
     def reject_complaint(self):
-        idx = self.get_selected_index()
-        if idx is None:
+        row = self.get_selected_row()
+        if row is None:
             return
-        if not os.path.exists(LOCAL_REPORTS):
-            return
-        with open(LOCAL_REPORTS, "r", encoding="utf-8") as f:
-            reports = json.load(f)
 
         dialog = QDialog(self)
         dialog.setWindowTitle("기각/취소 사유")
@@ -256,12 +270,10 @@ class AdminWindow(QWidget):
             if not reason:
                 QMessageBox.warning(self, "입력 오류", "사유를 입력하세요.")
                 return
-            reports[idx]["status"] = "기각"
-            reports[idx]["reject_reason"] = reason
-            with open(LOCAL_REPORTS, "w", encoding="utf-8") as f:
-                json.dump(reports, f, ensure_ascii=False, indent=2)
 
-            phone = get_user_phone(reports[idx]["user_id"])
+            self._update_status(row, "기각", reason=reason)
+
+            phone = get_user_phone(row["user_id"])
             send_sms_notification(
                 phone,
                 f"[안전신고] 접수하신 민원이 기각되었습니다. 사유: {reason}"
@@ -269,6 +281,49 @@ class AdminWindow(QWidget):
 
             QMessageBox.information(self, "완료", "기각/취소 처리되었습니다.")
             self.load_complaints()
+
+    def _update_status(self, row, new_status, reason=None):
+        """선택된 신고 1건의 상태를 바꾸고, DB 모드일 때만 admin_actions 감사 이력을 남긴다.
+        어느 저장소를 쓸지는 load_complaints가 정한 self.data_source를 그대로 따른다
+        (조회 때 DB를 썼으면 갱신도 DB로, 로컬 JSON을 썼으면 갱신도 로컬로 — 둘이 어긋나면
+        읽은 목록과 실제로 바뀌는 데이터가 달라지는 문제가 있었음)."""
+        action = "완료처리" if new_status == "완료" else ("기각" if new_status == "기각" else None)
+
+        if self.data_source == "db":
+            try:
+                from db.connection import get_connection
+                conn = get_connection()
+                cursor = conn.cursor()
+                if reason is not None:
+                    cursor.execute(
+                        "UPDATE reports SET status = %s, reject_reason = %s WHERE id = %s",
+                        (new_status, reason, row["id"])
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE reports SET status = %s WHERE id = %s",
+                        (new_status, row["id"])
+                    )
+                if action:
+                    cursor.execute(
+                        "INSERT INTO admin_actions (report_id, admin_id, action, reason) VALUES (%s,%s,%s,%s)",
+                        (row["id"], self.admin_id, action, reason)
+                    )
+                conn.commit()
+                conn.close()
+                return
+            except Exception:
+                pass  # DB 갱신 실패 시 로컬로 폴백
+
+        if not os.path.exists(LOCAL_REPORTS):
+            return
+        with open(LOCAL_REPORTS, "r", encoding="utf-8") as f:
+            reports = json.load(f)
+        reports[row["id"]]["status"] = new_status
+        if reason is not None:
+            reports[row["id"]]["reject_reason"] = reason
+        with open(LOCAL_REPORTS, "w", encoding="utf-8") as f:
+            json.dump(reports, f, ensure_ascii=False, indent=2)
 
     def handle_logout(self):
         from ui.login import LoginWindow

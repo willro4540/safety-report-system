@@ -77,7 +77,8 @@ class HistoryWindow(QWidget):
             conn = get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT id, location, content, status, created_at FROM complaints WHERE user_id = %s ORDER BY created_at DESC",
+                "SELECT id, type, location, content, status, reject_reason, created_at "
+                "FROM reports WHERE user_id = %s ORDER BY created_at DESC",
                 (self.user_id,)
             )
             rows = cursor.fetchall()
@@ -85,10 +86,11 @@ class HistoryWindow(QWidget):
             if rows:
                 self.list_widget.clear()
                 for row in rows:
-                    status = row[3]
+                    status = row[4]
                     icon = self.status_icon(status)
+                    reason = f" | 사유: {row[5]}" if status == "기각" and row[5] else ""
                     self.list_widget.addItem(
-                        f"{icon} [{row[4]}] {row[1]} — {row[2][:30]} ({status})"
+                        f"{icon} [{row[6]}] {row[1]} | {row[2]} — {row[3][:20]} ({status}){reason}"
                     )
                 loaded = True
         except:
