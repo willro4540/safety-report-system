@@ -1,0 +1,397 @@
+<div style="background-color:#ffffff; color:#1e293b; font-family:-apple-system,'Malgun Gothic',sans-serif; line-height:1.8; max-width:100%;">
+
+<h1 style="color:#1e40af; border-bottom:3px solid #2563eb; padding-bottom:10px;">시설 안전 민원 신고 프로그램 v2 — MySQL 실연동 + 신고/감사이력 스키마 재구축</h1>
+
+<p>v1(초기 버전)은 데이터베이스(MySQL) 연결 코드가 <strong style="color:#1e40af;">일부러 막혀있는 상태</strong>였습니다.
+<code>db/connection.py</code>가 항상 예외를 던지도록 되어 있어서, 신고 접수/조회/처리 전부
+로컬 JSON 파일로만 동작했습니다. 이번 글은 그 목업(가짜 동작)을 걷어내고, 실제 MySQL에
+신고가 저장되고 관리자 처리 이력까지 남는 구조로 바꾼 과정을 처음부터 끝까지 다룹니다.
+프로그래밍을 몰라도 순서대로 따라오면 똑같이 만들 수 있게 썼습니다.</p>
+
+<div style="background-color:#eff6ff; padding:14px 18px; border-radius:8px; font-weight:bold; color:#1e40af; margin:20px 0;">
+이 글을 다 따라 하면: 로컬 JSON 파일에만 의존하던 신고 프로그램이, 진짜 MySQL 데이터베이스에
+신고를 저장하고 관리자가 언제/누구에게 어떤 처분을 내렸는지까지 별도 표로 남기는 구조로
+바뀝니다.
+</div>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">0. 용어 사전 (처음 나올 때 한글 발음도 같이)</h2>
+
+<div style="background-color:#f8fafc; border:1px solid #dbeafe; border-radius:8px; padding:16px 20px;">
+<ul style="margin:0; padding-left:20px;">
+<li><strong style="color:#1e40af;">스키마(schema, 스키마)</strong> — 데이터베이스에 어떤 표(테이블)와 어떤 칸(컬럼)이 있는지 미리 정해둔 설계도</li>
+<li><strong style="color:#1e40af;">목업(mock, 목)</strong> — 실제 기능 대신 가짜로 동작을 흉내내는 구현. 비용/자원 없이 개발 가능하게 해줌</li>
+<li><strong style="color:#1e40af;">ENUM(이넘)</strong> — 컬럼에 들어올 수 있는 값을 미리 정한 목록으로만 제한하는 MySQL 컬럼 타입</li>
+<li><strong style="color:#1e40af;">FOREIGN KEY(포린 키, 외래키)</strong> — 한 테이블의 값이 다른 테이블에 실제로 존재하는 값만 가리키도록 강제하는 제약</li>
+<li><strong style="color:#1e40af;">bcrypt(비크립트)</strong> — 비밀번호를 안전하게 암호화(해시)하는 방식. 결과 문자열이 항상 60자로 고정됨</li>
+<li><strong style="color:#1e40af;">pymysql(파이마이에스큐엘)</strong> — 파이썬 코드가 MySQL에 접속할 수 있게 해주는 라이브러리</li>
+<li><strong style="color:#1e40af;">EPSG / WGS84(더블유지에스84)</strong> — 전 세계 좌표계를 코드로 표준화한 체계. EPSG:4326 = WGS84 = GPS가 기본으로 쓰는 위도·경도 좌표계</li>
+<li><strong style="color:#1e40af;">감사 이력(audit log, 오딧 로그)</strong> — "누가·언제·무엇을" 했는지 원본 데이터와 별도 표에 남기는 기록</li>
+</ul>
+</div>
+
+<blockquote style="border-left:4px solid #2563eb; background-color:#eff6ff; padding:12px 18px; margin:20px 0; color:#1e293b;">
+<strong style="color:#1e40af;">기억할 한 문장</strong>: 코드 안에 SQL 문장이 적혀 있다고 실제로 DB에 저장되는 게 아니다 —
+연결(connection)이 진짜로 되어 있어야 그 SQL이 비로소 실행된다.
+</blockquote>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">1. 왜 패치가 아니라 다시 짜야 했는가 — 코드를 열어보고 찾은 문제</h2>
+
+<p>v1 코드를 처음부터 다시 읽어보니, DB가 막혀있다는 것 말고도 실제로 여러 군데가
+어긋나 있었습니다. 이 문제들을 먼저 정리하지 않으면 MySQL을 살려도 제대로 동작하지
+않았을 겁니다.</p>
+
+<div style="background-color:#f8fafc; border:1px solid #dbeafe; border-radius:8px; padding:16px 20px;">
+<ul style="margin:0; padding-left:20px;">
+<li><strong style="color:#1e40af;">신고 접수 코드에 DB 저장 시도 자체가 없었음</strong> — <code>ui/report.py</code>는 로컬 JSON에만 썼고, MySQL을 살려도 신고는 여전히 DB에 안 들어감</li>
+<li><strong style="color:#1e40af;">관리자 처리 코드도 DB 갱신 없음</strong> — 상태 변경/기각 처리가 항상 로컬 JSON만 고쳤음</li>
+<li><strong style="color:#1e40af;">테이블 이름이 이미 어긋나 있었음</strong> — SQL 문은 <code>complaints</code>를 쓰는데, 파일명·변수명은 전부 <code>report</code> 계열</li>
+<li><strong style="color:#1e40af;">DB 조회 컬럼이 로컬 JSON보다 적었음</strong> — 신고 유형, 사진 경로, 기각 사유가 DB <code>SELECT</code> 문에는 빠져있었음</li>
+<li><strong style="color:#1e40af;">회원가입 코드가 권한(role) 컬럼을 안 채움</strong> — <code>signup.py</code>의 <code>INSERT</code>에 role이 없었음</li>
+</ul>
+</div>
+
+<p>즉 SMS 알림 기능(관리자가 상태를 바꾸면 신고자에게 문자 발송)이 제대로 작동하려면,
+회원·신고 데이터를 다루는 방식 전체를 다시 설계해야 했습니다.</p>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">2. MySQL에 실제 테이블 만들기 (schema.sql)</h2>
+
+<p>먼저 데이터베이스 자체를 설계도(스키마)대로 만듭니다. <code>users</code>(회원),
+<code>reports</code>(신고, 기존 <code>complaints</code>에서 이름 통일), <code>admin_actions</code>
+(관리자 처리 감사 이력) 3개 표를 만듭니다.</p>
+
+<p><strong style="color:#1e40af;">⚡ 원문 통짜 보기 (숙련자용, 절차 생략하고 바로 치기)</strong></p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0 18px;">mysql --version
+mysql -u root -p &lt; db/schema.sql
+mysql -u root -p safety_report</pre>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">1.</strong> 터미널(bash 또는 PowerShell)에서 MySQL이 설치되어 있는지 확인한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">mysql --version</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ <code>mysql Ver 8.x.xx</code> 처럼 버전이 뜨면 설치되어 있는 것.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">2.</strong> (같은 bash/PowerShell 창에서) 프로젝트 폴더로 이동한 뒤, <code>db/schema.sql</code> 파일을 통째로 실행한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">mysql -u root -p &lt; db/schema.sql</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 비밀번호를 물으면 MySQL root 비밀번호 입력. 아무 글자도 안 뜨면 성공 (표 3개가 만들어진 것).</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">3.</strong> 잘 만들어졌는지 <code>mysql</code> 프롬프트로 직접 들어가서 확인한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">mysql -u root -p safety_report</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 프롬프트가 <code>mysql&gt;</code>로 바뀐다 (여기서부터는 bash가 아니라 mysql 프롬프트).</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">4.</strong> <code>mysql&gt;</code> 프롬프트에서 아래를 입력한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">SHOW TABLES;</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ <code>users</code>, <code>reports</code>, <code>admin_actions</code> 3줄이 표로 뜨면 성공.</p>
+
+<details style="margin:20px 0; border:1px solid #dbeafe; border-radius:8px; padding:12px 20px; background-color:#f8fafc;">
+<summary style="color:#1e40af; font-weight:700; cursor:pointer;">🔧 db/schema.sql 전체 코드 (심화)</summary>
+<div style="margin-top:12px;">
+
+<p>이 파일이 왜 이렇게 생겼는지: <code>VARCHAR(60)</code>은 bcrypt 해시가 항상 60자이기 때문에
+고정한 것이고, <code>role</code>/<code>status</code>를 <code>ENUM</code>으로 제한한 건 "말이 안 되는
+값"(예: 상태에 오타)이 아예 저장되지 못하게 DB 차원에서 막는 것입니다. <code>FOREIGN KEY</code>는
+존재하지 않는 회원 ID로 신고가 등록되는 것을 DB가 스스로 거부하게 만듭니다.</p>
+
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0; white-space:pre-wrap;">CREATE DATABASE IF NOT EXISTS safety_report
+    CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+USE safety_report;
+
+-- 회원(신고자/관리자 공통)
+CREATE TABLE users (
+    user_id     VARCHAR(20)  PRIMARY KEY,
+    password    VARCHAR(60)  NOT NULL,   -- bcrypt 해시 고정 길이(60자)
+    name        VARCHAR(50)  NOT NULL,
+    phone       VARCHAR(20)  NOT NULL,
+    role        ENUM('user','admin') NOT NULL DEFAULT 'user',
+    created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB CHARACTER SET utf8mb4;
+
+-- 민원 신고 (구 SQL의 complaints → reports로 통일)
+CREATE TABLE reports (
+    id             INT AUTO_INCREMENT PRIMARY KEY,
+    user_id        VARCHAR(20)  NOT NULL,
+    type           VARCHAR(30)  NOT NULL,
+    location       VARCHAR(255) NOT NULL,   -- 사람이 읽는 주소/설명 텍스트
+    latitude       DOUBLE       NULL,       -- EPSG:4326(WGS84), GPS EXIF 원본값 그대로
+    longitude      DOUBLE       NULL,       -- EPSG:4326(WGS84)
+    content        TEXT         NOT NULL,
+    image_path     VARCHAR(255) NULL,
+    status         ENUM('접수','처리중','완료','기각') NOT NULL DEFAULT '접수',
+    reject_reason  TEXT         NULL,
+    created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id)
+) ENGINE=InnoDB CHARACTER SET utf8mb4;
+
+-- 관리자 처리 이력 (감사 로그)
+CREATE TABLE admin_actions (
+    id           INT AUTO_INCREMENT PRIMARY KEY,
+    report_id    INT          NOT NULL,
+    admin_id     VARCHAR(20)  NOT NULL,
+    action       ENUM('완료처리','기각') NOT NULL,
+    reason       TEXT         NULL,
+    created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (report_id) REFERENCES reports(id),
+    FOREIGN KEY (admin_id)  REFERENCES users(user_id)
+) ENGINE=InnoDB CHARACTER SET utf8mb4;</pre>
+
+</div>
+</details>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">3. .env 파일에 DB 접속 정보 채우기</h2>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">1.</strong> 프로젝트 폴더의 <code>.env.example</code>을 복사해서 <code>.env</code>라는 이름으로 저장한다.</p>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 같은 폴더에 <code>.env</code> 파일이 새로 생긴다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">2.</strong> <code>.env</code> 파일을 열어 <code>DB_HOST</code>, <code>DB_USER</code>, <code>DB_PASSWORD</code>, <code>DB_NAME</code> 값을 본인 MySQL 설정에 맞게 채운다 (DB_NAME은 <code>safety_report</code> 그대로 둔다).</p>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 저장 후 닫으면 끝. 이 파일은 <code>.gitignore</code>에 등록되어 있어 GitHub에는 올라가지 않는다.</p>
+
+<div style="background-color:#eff6ff; padding:14px 18px; border-radius:8px; margin:20px 0;">
+<code>.env</code>는 절대 커밋하지 않는다 — 비밀번호가 그대로 담긴 파일이기 때문에, 실수로
+GitHub에 올라가면 누구나 내 DB에 접속할 수 있게 된다.
+</div>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">4. db/connection.py — 가짜 연결 걷어내기</h2>
+
+<p>기존 <code>get_connection()</code>은 무조건 예외를 던져서 DB 연결을 강제로 실패시켰습니다.
+그 아래에 이미 진짜 연결 코드가 주석(<code>'''...'''</code>)으로 준비되어 있었길래, 그 함수를
+그대로 살리고 가짜 예외를 지웠습니다.</p>
+
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0; white-space:pre-wrap;">def get_connection():
+    return pymysql.connect(
+        host = os.getenv("DB_HOST", "localhost"),
+        user = os.getenv("DB_USER", "root"),
+        password = os.getenv("DB_PASSWORD", ""),
+        database = os.getenv("DB_NAME", "safety_report"),
+        charset = "utf8mb4"
+    )</pre>
+
+<p><code>.env</code>가 없거나 MySQL이 안 떠 있으면 이 함수 호출 자체가 예외를 던지는데,
+다른 파일들의 <code>try/except</code> 구조가 그 예외를 잡아서 자동으로 로컬 JSON 모드로
+전환하도록 이미 짜여 있었습니다 — 그래서 이 한 곳만 고쳐도 나머지가 그대로 작동합니다.</p>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">5. ui/report.py — 위도·경도를 별도 칸에 저장하기</h2>
+
+<p><strong style="color:#1e40af;">비유</strong>: 기존 코드는 주소록 한 칸에 "홍길동010-1234-5678"을
+통째로 적어놓은 것과 같았습니다. 사진에서 GPS를 뽑으면 <code>"위도: 35.123456, 경도: 126.789012"</code>
+라는 <strong>문자열</strong> 하나로만 저장됐는데, 지도 기능은 문자열이 아니라 <strong>숫자</strong>를
+요구합니다. 그래서 GPS를 추출하는 순간 위도·경도를 별도 변수로도 붙잡아 두게 고쳤습니다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">1.</strong> <code>__init__</code>에 좌표를 담을 변수 2개를 추가한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">self.latitude = None
+self.longitude = None</pre>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">2.</strong> <code>extract_gps()</code>에서 좌표를 계산하자마자 그 변수에 저장한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">self.latitude = lat
+self.longitude = lon</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 화면에는 여전히 "위도: .., 경도: .." 문자열이 보이지만, 내부적으로는 숫자도 따로 저장된 상태.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">3.</strong> 신고 접수 시 로컬 JSON 대신 새로 만든 <code>save_report()</code>를 호출하도록 바꾼다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">self.save_report(report_type, location, content)</pre>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">4.</strong> DB 저장을 먼저 시도하고, 실패하면 로컬 JSON으로 자동 전환하는 함수를 새로 만든다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0; white-space:pre-wrap;">def save_report(self, report_type, location, content):
+    try:
+        from db.connection import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO reports (user_id, type, location, latitude, longitude, content, image_path) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (self.user_id, report_type, location, self.latitude, self.longitude,
+             content, self.image_path or "")
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        self.save_local(report_type, location, content)</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ MySQL이 살아있으면 <code>reports</code> 표에 한 줄이 새로 생긴다. DB가 없으면 기존처럼 <code>local_reports.json</code>에 저장된다.</p>
+
+<details style="margin:20px 0; border:1px solid #dbeafe; border-radius:8px; padding:12px 20px; background-color:#f8fafc;">
+<summary style="color:#1e40af; font-weight:700; cursor:pointer;">🔧 save_local()에도 좌표 추가하기 (심화)</summary>
+<div style="margin-top:12px;">
+
+<p>DB가 없는 개발 환경에서도 좌표가 기록되도록, 로컬 JSON에 저장하는 <code>save_local()</code>
+딕셔너리에도 <code>latitude</code>/<code>longitude</code> 두 줄을 추가합니다:</p>
+
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0; white-space:pre-wrap;">data = {
+    "user_id": self.user_id,
+    "type": report_type,
+    "location": location,
+    "latitude": self.latitude,
+    "longitude": self.longitude,
+    "content": content,
+    "status": "접수",
+    "image_path": self.image_path or "",
+    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+}</pre>
+
+</div>
+</details>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">6. ui/admin.py — 관리자 처리 감사 이력 남기기 (가장 큰 변경)</h2>
+
+<p><strong style="color:#1e40af;">비유</strong>: 기존 코드는 도서관에서 책장 A(DB 목록)를 보고
+"3번째 책"을 골랐는데, 실제로 빼내는 건 책장 B(로컬 JSON 파일)의 3번째 책이었던 것과
+같은 상태였습니다. 두 책장의 순서가 우연히 같을 때만 문제가 안 드러났습니다.</p>
+
+<p><strong style="color:#1e40af;">정의</strong>: 원래 화면 목록은 DB가 연결되면 DB 데이터를
+보여주는데, "상태 변경"/"기각" 버튼을 누르면 <strong>항상 로컬 JSON 파일만</strong> 수정했습니다.
+DB가 연결된 상태에서는 화면에 보이는 신고와 실제로 바뀌는 데이터가 서로 다른 신고일 수
+있었던 것입니다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">1.</strong> 목록을 불러올 때, DB든 로컬이든 결과를 <strong>같은 모양의 딕셔너리 리스트</strong>로 통일해서 저장한다 (<code>self.current_rows</code>), 그리고 어느 쪽을 썼는지도 기록한다 (<code>self.data_source</code>):</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0; white-space:pre-wrap;">self.data_source = "db"
+for row in rows:
+    self.current_rows.append({
+        "id": row[0], "user_id": row[1], "type": row[2],
+        "location": row[3], "content": row[4], "status": row[5],
+        "reject_reason": row[6], "created_at": row[7]
+    })</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ (DB 실패 시) <code>self.data_source = "local"</code>로 바뀌고 로컬 JSON에서 같은 모양으로 채워진다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">2.</strong> 선택한 항목을 텍스트 파싱 대신, 화면 목록의 실제 선택 위치로 바로 꺼낸다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0; white-space:pre-wrap;">def get_selected_row(self):
+    idx = self.list_widget.currentRow()
+    if idx < 0 or idx >= len(self.current_rows):
+        QMessageBox.warning(self, "선택 오류", "신고 항목을 선택하세요.")
+        return None
+    return self.current_rows[idx]</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 기존처럼 화면 텍스트의 대괄호 숫자를 다시 읽어서 해석하는 방식보다 훨씬 안전해진다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">3.</strong> 상태를 바꿀 때, <strong>목록을 읽었던 곳과 똑같은 곳에</strong> 쓰도록 함수 하나로 통일한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0; white-space:pre-wrap;">def _update_status(self, row, new_status, reason=None):
+    action = "완료처리" if new_status == "완료" else ("기각" if new_status == "기각" else None)
+
+    if self.data_source == "db":
+        try:
+            from db.connection import get_connection
+            conn = get_connection()
+            cursor = conn.cursor()
+            if reason is not None:
+                cursor.execute(
+                    "UPDATE reports SET status = %s, reject_reason = %s WHERE id = %s",
+                    (new_status, reason, row["id"])
+                )
+            else:
+                cursor.execute(
+                    "UPDATE reports SET status = %s WHERE id = %s",
+                    (new_status, row["id"])
+                )
+            if action:
+                cursor.execute(
+                    "INSERT INTO admin_actions (report_id, admin_id, action, reason) VALUES (%s,%s,%s,%s)",
+                    (row["id"], self.admin_id, action, reason)
+                )
+            conn.commit()
+            conn.close()
+            return
+        except Exception:
+            pass  # DB 갱신 실패 시 로컬로 폴백
+
+    if not os.path.exists(LOCAL_REPORTS):
+        return
+    with open(LOCAL_REPORTS, "r", encoding="utf-8") as f:
+        reports = json.load(f)
+    reports[row["id"]]["status"] = new_status
+    if reason is not None:
+        reports[row["id"]]["reject_reason"] = reason
+    with open(LOCAL_REPORTS, "w", encoding="utf-8") as f:
+        json.dump(reports, f, ensure_ascii=False, indent=2)</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ DB 모드면 <code>reports.status</code>가 갱신되고, "완료"/"기각" 처리일 때만 <code>admin_actions</code>에 감사 이력 한 줄이 추가로 생긴다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">4.</strong> 감사 이력에 "누가" 처리했는지 남기려면 로그인한 관리자 ID가 필요하다. <code>AdminWindow</code>가 그 값을 받도록 생성자를 바꾼다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">def __init__(self, admin_id):
+    super().__init__()
+    self.admin_id = admin_id
+    self.data_source = None
+    self.current_rows = []</pre>
+
+<details style="margin:20px 0; border:1px solid #dbeafe; border-radius:8px; padding:12px 20px; background-color:#f8fafc;">
+<summary style="color:#1e40af; font-weight:700; cursor:pointer;">🔧 get_user_phone()도 DB부터 조회하게 바꾸기 (심화)</summary>
+<div style="margin-top:12px;">
+
+<p>SMS 발송 시 전화번호를 조회하는 <code>get_user_phone()</code>도 원래는 로컬 JSON만 봤습니다.
+이제 <code>users</code> 표가 실제로 있으니, DB부터 먼저 확인하도록 바꿉니다:</p>
+
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0; white-space:pre-wrap;">def get_user_phone(user_id):
+    try:
+        from db.connection import get_connection
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT phone FROM users WHERE user_id = %s", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if row:
+            return row[0]
+    except Exception:
+        pass
+
+    if not os.path.exists(LOCAL_USERS):
+        return None
+    with open(LOCAL_USERS, "r", encoding="utf-8") as f:
+        users = json.load(f)
+    for u in users:
+        if u.get("user_id") == user_id:
+            return u.get("phone")
+    return None</pre>
+
+</div>
+</details>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">7. 나머지 자잘한 수정 — history.py / signup.py / login.py</h2>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">1.</strong> <code>ui/history.py</code>의 SQL 테이블명을 <code>complaints</code>에서 <code>reports</code>로 바꾸고, 빠져있던 <code>type</code>/<code>reject_reason</code> 컬럼을 조회 목록에 추가한다.</p>
+<p style="color:#2563eb; margin:2px 0 14px;">→ DB 모드로 봐도 로컬 모드로 볼 때와 똑같은 정보량이 표시된다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">2.</strong> <code>ui/signup.py</code>의 회원가입 <code>INSERT</code>에 <code>role</code> 컬럼을 명시적으로 채운다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">cursor.execute(
+    "INSERT INTO users (user_id, password, name, phone, role) VALUES (%s,%s,%s,%s,%s)",
+    (user_id, hashed_pw, user_name, user_phone, "user")
+)</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 새로 가입하는 회원은 항상 <code>role='user'</code>로 명확히 저장된다(이전엔 이 값이 안 채워져서 DB 기본값에만 의존했음).</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">3.</strong> <code>ui/login.py</code>에서 관리자로 로그인했을 때, 로그인한 <code>user_id</code>를 <code>AdminWindow</code>에 넘겨준다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">self.main_window = AdminWindow(user_id)</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 이제 관리자 패널이 "누가 로그인했는지"를 알고 있어서, 감사 이력에 정확한 admin_id가 남는다.</p>
+
+<h2 style="color:#1e40af; border-left:5px solid #2563eb; padding-left:12px;">8. 브랜치 만들고 GitHub에 올리기</h2>
+
+<p><strong style="color:#1e40af;">⚡ 원문 통짜 보기 (숙련자용, 절차 생략하고 바로 치기)</strong></p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0 18px;">git checkout -b feature/v2-mysql-map
+git add db/connection.py db/schema.sql ui/report.py ui/admin.py ui/history.py ui/login.py ui/signup.py
+git commit -m "feat: MySQL 실연동 + reports/admin_actions 스키마 재구축"
+git push -u origin feature/v2-mysql-map</pre>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">1.</strong> (bash 프롬프트, 프로젝트 폴더 안에서) 기존 SMS 브랜치를 기준으로 새 브랜치를 만든다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">git checkout -b feature/v2-mysql-map</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ <code>Switched to a new branch 'feature/v2-mysql-map'</code> 메시지가 뜬다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">2.</strong> 바뀐 파일들을 스테이징한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">git add db/connection.py db/schema.sql ui/report.py ui/admin.py ui/history.py ui/login.py ui/signup.py</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 아무 글자도 안 뜨면 정상.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">3.</strong> 커밋한다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">git commit -m "feat: MySQL 실연동 + reports/admin_actions 스키마 재구축"</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ <code>8 files changed, ...</code> 같은 요약 줄이 뜬다.</p>
+
+<p style="margin:14px 0 2px;"><strong style="color:#1e40af;">4.</strong> GitHub로 올린다:</p>
+<pre style="background:#1e293b; color:#e2e8f0; padding:10px 14px; border-radius:6px; border-left:4px solid #2563eb; font-family:'Consolas','D2Coding',monospace; margin:4px 0;">git push -u origin feature/v2-mysql-map</pre>
+<p style="color:#2563eb; margin:2px 0 14px;">→ 진행률(%) 표시 후 <code>new branch feature/v2-mysql-map</code> 완료 메시지가 뜬다.</p>
+
+<div style="background-color:#eff6ff; padding:14px 18px; border-radius:8px; margin:20px 0;">
+이번 커밋은 원칙(직접 타이핑)의 예외로 Claude가 대신 작성했습니다 — 왜 예외가 됐는지는
+<code>safety_report_study_procedure.md</code> 17번 항목에 그대로 남겨뒀습니다. 다음 변경부터는
+다시 직접 타이핑하는 방식으로 돌아갑니다.
+</div>
+
+<hr style="border:none; border-top:1px solid #dbeafe; margin:32px 0;">
+
+<div style="background-color:#1e40af; color:#ffffff; padding:16px 20px; border-radius:8px; font-weight:bold; text-align:center;">
+SQL 문이 코드에 있다고 저장되는 게 아니다 — 연결이 진짜로 되어 있어야, 그 SQL이 비로소
+실행된다. 이 한 문장만 기억하면 이번 재구축의 핵심을 다 기억하는 것이다.
+</div>
+
+<p style="color:#64748b; font-style:italic; font-size:13px; margin-top:24px;">
+※ 이 글의 터미널 명령어는 bash 기준이며, Windows PowerShell에서도 <code>mysql</code>/<code>git</code>
+명령어 자체는 동일하게 동작합니다.
+</p>
+
+</div>

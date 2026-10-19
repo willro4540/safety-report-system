@@ -39,6 +39,8 @@
 | 16 | 스키마 설계 | `db/schema.sql` 신설 — `users`(role ENUM 포함), `reports`(`complaints`→`reports`로 명칭 통일, latitude/longitude DOUBLE 추가), `admin_actions`(관리자 처리 감사 이력, 별도 테이블) 3개 테이블 확정 | bcrypt 해시는 항상 60자라 `VARCHAR(60)` 고정, 상태값은 `ENUM`으로 제한, `FOREIGN KEY`로 참조 무결성 확보 — 로컬 JSON엔 없던 안전장치들 | ✅ 사용자 확인 거쳐 확정(테이블명 reports 채택, 감사 이력은 DB 테이블+문서화 병행) |
 | 17 | ⚠️ 예외: Claude가 대신 코드 작성 | 이 프로젝트 원칙(본인이 직접 타이핑)을 어기고, `db/connection.py`/`ui/report.py`/`ui/admin.py`/`ui/history.py`/`ui/login.py`/`ui/signup.py` 6개 파일을 Claude가 직접 수정함 | **사유(양쪽 다)**: (1) 사용자가 "진행하자 아직 선언이후 아무것도 하지않음"이라며 재촉 — 브랜치 생성처럼 본인이 직접 치기로 했던 명령조차 실행하지 않은 채 진행을 요구한 것 자체가 **안이한 태도**였음을 스스로 인정. (2) Claude도 그 재촉을 그대로 "코드까지 다 짜도 된다"는 뜻으로 확대 해석해 전부 작성 — 사용자가 "내가 해야하는거 아니야?"로 지적한 뒤에야 멈춤. 커밋 없이 워킹 트리 상태로 확인받은 뒤, 사용자 요청으로 이 배치는 예외로 남기고 GitHub에 반영 | ⚠️ 반성 — 이후 변경은 다시 "직접 타이핑" 원칙 복귀, 이번 배치는 **코드를 처음부터 같이 읽으며 이해**하는 방식으로 세션 진행 |
 
+| 18 | 문서화 | `docs/tistory_v2_mysql_스키마_재구축.html` 신설 — 흰색/파랑 팔레트, 절차형(정비교범) 스타일로 이번 MySQL/스키마 재구축 전 과정을 매뉴얼화 | `tistory_publish_guide.md` 규칙 그대로 적용(원문 통짜 보기 + 절차형 스텝 + 심화는 details 접기), schema.sql/connection.py/report.py/admin.py 전체 코드 포함 | ✅ 티스토리 발행용 초안(GitHub docs/ 폴더에 소스 보관) |
+
 ## 다음 진행 예정
 
 - [ ] `feature/sms-notification` 브랜치 커밋/푸시 (사용자가 직접 실행 예정)
